@@ -154,6 +154,10 @@ app.post("/helius", async (req, res) => {
 
 // ------------------ START ------------------
 
-app.listen(4000, () => {
-  console.log("🔥 MIROMA COPY BOT ONLINE – PORTA 4000 🔥");
+const PORT = process.env.PORT || 4000;
+
+app.listen(PORT, () => {
+  console.log(`🔥 MIROMA COPY BOT ONLINE – PORTA ${PORT} 🔥`);
 });
+
+
