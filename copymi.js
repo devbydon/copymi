@@ -4,14 +4,14 @@ import axios from "axios";
 import {
   Connection,
   Keypair,
-  VersionedTransaction
+  VersionedTransaction,
 } from "@solana/web3.js";
 
 const app = express();
 app.use(bodyParser.json());
 
 /* ============================================================
-   CONFIGURAÇÕES
+   CONFIGURAÇÃO
 ============================================================ */
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API}`;
 const connection = new Connection(HELIUS_RPC);
@@ -21,13 +21,14 @@ const BOT_KEYPAIR = Keypair.fromSecretKey(BOT_PRIVATE_KEY);
 const BOT_PUBLIC = BOT_KEYPAIR.publicKey.toBase58();
 
 const MONITORED_WALLETS = process.env.WALLETS
-  ? process.env.WALLETS.split(",").map(w => w.trim())
+  ? process.env.WALLETS.split(",").map((w) => w.trim())
   : [];
 
-const JUP_API_KEY = process.env.JUP_API_KEY;
+// Jupiter endpoints corretos
+const JUPITER_QUOTE = "https://api.jup.ag/quote";
+const JUPITER_SWAP = "https://api.jup.ag/swap";
 
-// ENDPOINT ULTRA (o mais rápido e grátis)
-const JUP_ULTRA = "https://api.jup.ag/ultra/";
+let processedSignatures = new Set();
 
 /* ============================================================
    LOG
@@ -37,7 +38,7 @@ function log(...msg) {
 }
 
 /* ============================================================
-   COMPRAR 1 USDC DO TOKEN DETECTADO
+   FUNÇÃO PARA COMPRAR 1 USDC DO TOKEN DETECTADO
 ============================================================ */
 async function buy1USDC(mint) {
   try {
@@ -46,30 +47,45 @@ async function buy1USDC(mint) {
     const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
     const amount = 1_000_000; // 1 USDC
 
-    // QUOTE JUPITER NORMAL (v6)
-    const quote = await axios.get("https://quote-api.jup.ag/v6/quote", {
+    /* =====================
+       1 - QUOTE
+    ====================== */
+    const { data: quote } = await axios.get(JUPITER_QUOTE, {
       params: {
         inputMint: USDC,
         outputMint: mint,
         amount,
-        slippageBps: 1000,
+        slippageBps: 2000, // 20% para memecoins voláteis
+      },
+      headers: {
+        "x-api-key": process.env.JUPITER_API_KEY,
       },
     });
 
-    if (!quote.data || !quote.data.outAmount) {
-      log("❌ Nenhuma rota encontrada para essa compra");
+    if (!quote || !quote.outAmount) {
+      log("❌ Nenhuma rota encontrada para essa compra.");
       return;
     }
 
-    // FETCH SWAP TX
-    const swap = await axios.post("https://quote-api.jup.ag/v6/swap", {
-      quoteResponse: quote.data,
-      userPublicKey: BOT_PUBLIC,
-      wrapAndUnwrapSol: true,
-      dynamicSlippage: true,
-    });
+    /* =====================
+       2 - SWAP
+    ====================== */
+    const { data: swap } = await axios.post(
+      JUPITER_SWAP,
+      {
+        quoteResponse: quote,
+        userPublicKey: BOT_PUBLIC,
+        dynamicSlippage: true,
+        wrapAndUnwrapSol: true,
+      },
+      {
+        headers: {
+          "x-api-key": process.env.JUPITER_API_KEY,
+        },
+      }
+    );
 
-    const raw = Buffer.from(swap.data.swapTransaction, "base64");
+    const raw = Buffer.from(swap.swapTransaction, "base64");
     const tx = VersionedTransaction.deserialize(raw);
 
     tx.sign([BOT_KEYPAIR]);
@@ -79,70 +95,70 @@ async function buy1USDC(mint) {
       maxRetries: 5,
     });
 
-    log(`🚀 SWAP EXECUTADO: https://solscan.io/tx/${sig}`);
-
+    log(`🚀 Compra executada com sucesso!`);
+    log(`🔗 https://solscan.io/tx/${sig}`);
   } catch (err) {
-    log("❌ ERRO NA COMPRA:", err.response?.data || err.message);
+    if (err.response?.data)
+      log("❌ ERRO NA COMPRA:", err.response.data);
+    else log("❌ ERRO NA COMPRA:", err.message);
   }
 }
 
 /* ============================================================
-   DETECTAR TOKEN RECEBIDO (swap buy)
+   DETECTAR COMPRAS DE TOKENS FUNGÍVEIS NAS WALLETS
 ============================================================ */
-function detectTokenBuys(event) {
-  const out = [];
-
+function detectTokenBuy(event) {
   try {
-    for (const acc of event.accountData) {
-      if (!acc.tokenBalanceChanges) continue;
+    const accounts = event.accountData;
 
-      for (const t of acc.tokenBalanceChanges) {
-        const user = t.userAccount;
-        const mint = t.mint;
-        const amount = Number(t.rawTokenAmount.tokenAmount);
+    let results = [];
 
-        // Fungível no pump.fun / jupiter
-        const isFungible = t.rawTokenAmount.decimals <= 12;
+    for (const acc of accounts) {
+      if (!acc.tokenBalanceChanges?.length) continue;
 
-        if (!isFungible) continue;
-        if (!MONITORED_WALLETS.includes(user)) continue;
-        if (amount <= 0) continue;
+      for (const c of acc.tokenBalanceChanges) {
+        const user = c.userAccount;
+        const mint = c.mint;
+        const amount = Number(c.rawTokenAmount.tokenAmount);
 
-        out.push({ user, mint, amount });
+        const fungible = c.rawTokenAmount.decimals <= 12;
+
+        if (fungible && amount > 0 && MONITORED_WALLETS.includes(user)) {
+          results.push({ user, mint, amount });
+        }
       }
     }
-  } catch (err) {
-    log("Erro parser:", err.message);
-  }
 
-  return out;
+    return results;
+  } catch (err) {
+    log("Erro detectTokenBuy:", err.message);
+    return [];
+  }
 }
 
 /* ============================================================
    WEBHOOK HELIUS
 ============================================================ */
-const seen = new Set();
-
 app.post("/helius", async (req, res) => {
   res.sendStatus(200);
 
-  const data = req.body;
-  if (!Array.isArray(data)) return;
+  const events = req.body;
+  if (!Array.isArray(events)) return;
 
-  for (const ev of data) {
-    const sig = ev.signature;
+  for (const event of events) {
+    const sig = event.signature;
 
-    // evitar duplicado
-    if (seen.has(sig)) continue;
-    seen.add(sig);
+    // Proteção anti duplicação
+    if (processedSignatures.has(sig)) continue;
+    processedSignatures.add(sig);
 
     log("===================================================");
     log(">>> RECEBI WEBHOOK");
     log("TX:", sig);
 
-    const buys = detectTokenBuys(ev);
+    const buys = detectTokenBuy(event);
 
-    if (buys.length === 0) {
+    if (!buys.length) {
       log("Nenhum swap de compra detectado.");
       continue;
     }
@@ -155,13 +171,12 @@ app.post("/helius", async (req, res) => {
 });
 
 /* ============================================================
-   START
+   START SERVER
 ============================================================ */
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🔥 MIROMA COPY BOT ONLINE – PORTA ${PORT} 🔥`);
-});
-
+app.listen(PORT, () =>
+  console.log(`🔥 MIROMA COPY BOT ONLINE – PORTA ${PORT} 🔥`)
+);
 
 
 
