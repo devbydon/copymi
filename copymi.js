@@ -4,13 +4,13 @@ import "dotenv/config";
 import { Connection, VersionedTransaction, Keypair } from "@solana/web3.js";
 
 const app = express();
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json());
 
 // ------------------ SOLANA CONNECTION ------------------
 
 const connection = new Connection("https://api.mainnet-beta.solana.com");
 
-// ------------------ WALLET DO COPYMI ------------------
+// ------------------ WALLET LOADER ------------------
 
 const PRIVATE_KEY = Uint8Array.from(JSON.parse(process.env.PRIVATE_KEY));
 const wallet = Keypair.fromSecretKey(PRIVATE_KEY);
@@ -18,14 +18,13 @@ const wallet = Keypair.fromSecretKey(PRIVATE_KEY);
 // ------------------ CONSTANTES ------------------
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
+const AMOUNT_IN_SOL = 0.015; // ~ $1.5 - $2
 
-// Valor da cópia: ~1 a 2 dólares
-const AMOUNT_IN_SOL = 0.015;
-
-// Telegram
 const TELEGRAM_URL = `https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`;
 
-// ------------------ FUNÇÕES UTILITÁRIAS ------------------
+// -----------------------------------------------------
+//                       TELEGRAM
+// -----------------------------------------------------
 
 async function sendTelegram(msg) {
   try {
@@ -35,9 +34,13 @@ async function sendTelegram(msg) {
       parse_mode: "Markdown"
     });
   } catch (err) {
-    console.error("Erro Telegram:", err);
+    console.error("Erro Telegram:", err?.response?.data || err);
   }
 }
+
+// -----------------------------------------------------
+//                  BIRDEYE TOKEN INFO
+// -----------------------------------------------------
 
 async function getTokenInfo(mint) {
   try {
@@ -54,52 +57,71 @@ async function getTokenInfo(mint) {
       symbol: data?.data?.symbol || "???"
     };
   } catch {
-    return { price: "N/A", liquidity: "N/A", mc: "N/A", vol5m: "N/A", symbol: "???" };
+    return {
+      price: "N/A",
+      liquidity: "N/A",
+      mc: "N/A",
+      vol5m: "N/A",
+      symbol: "???"
+    };
   }
 }
 
+// -----------------------------------------------------
+//                    JUPITER SWAP
+// -----------------------------------------------------
+
 async function executeSwap(inputMint, outputMint) {
   try {
+    console.log(">>> EXECUTANDO SWAP", inputMint, "→", outputMint);
+
     const amount = AMOUNT_IN_SOL * 1e9;
 
-    const { data: quote } = await axios.get(
+    const quote = await axios.get(
       `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=300`
     );
 
-    const { data: swap } = await axios.post(
+    const swapTx = await axios.post(
       "https://quote-api.jup.ag/v6/swap",
       {
-        route: quote,
-        userPublicKey: wallet.publicKey.toBase58(),
+        route: quote.data,
+        userPublicKey: wallet.publicKey.toBase58()
       }
     );
 
     const tx = VersionedTransaction.deserialize(
-      Buffer.from(swap.swapTransaction, "base64")
+      Buffer.from(swapTx.data.swapTransaction, "base64")
     );
 
     tx.sign([wallet]);
 
     const sig = await connection.sendRawTransaction(tx.serialize());
+    console.log(">>> SWAP TX SIGNATURE:", sig);
     return sig;
 
   } catch (err) {
-    console.error("Erro no swap:", err.message);
+    console.error("Erro swap:", err?.response?.data || err);
     return null;
   }
 }
 
-// ------------------ WEBHOOK HELIUS ------------------
+// -----------------------------------------------------
+//                     HELIUS WEBHOOK
+// -----------------------------------------------------
 
 app.post("/helius", async (req, res) => {
   try {
+    console.log("===================================================");
+    console.log(">>> RECEBI WEBHOOK");
+
     const tx = Array.isArray(req.body) ? req.body[0] : req.body;
 
-    console.log(">>> RECEBI WEBHOOK");
-    console.log("RAW BODY:", JSON.stringify(req.body, null, 2));
-    console.log("TX:", JSON.stringify(tx, null, 2));
+    console.log(">>> RAW PAYLOAD:", JSON.stringify(req.body, null, 2));
 
-    if (!tx) return res.status(200).send("NO_TX");
+    if (!tx) {
+      console.log(">>> NO_TX");
+      return res.status(200).send("NO_TX");
+    }
 
     const transfers = tx.tokenTransfers || [];
     const instructions = tx.instructions || [];
@@ -107,52 +129,35 @@ app.post("/helius", async (req, res) => {
     console.log(">>> TRANSFERS:", transfers);
     console.log(">>> INSTRUCTIONS:", instructions);
 
-    const isSwap = instructions.some(i =>
-      `${i.programId}`.toLowerCase().includes("jup") ||
-      `${i.programId}`.toLowerCase().includes("rayd") ||
-      `${i.programId}`.toLowerCase().includes("orca")
-    );
+    // Detectores universais de SWAP
+    const isSwap = instructions.some(i => {
+      const p = String(i.programId).toLowerCase();
+      return (
+        p.includes("jup") ||  // Jupiter
+        p.includes("rayd") || // Raydium
+        p.includes("orca")    // Orca
+      );
+    });
 
-    console.log(">>> ISSWAP:", isSwap);
+    console.log(">>> IS_SWAP:", isSwap);
 
     if (!isSwap) return res.status(200).send("NOT_SWAP");
-
     if (transfers.length === 0) return res.status(200).send("NO_TRANSFERS");
 
     const mint = transfers[0].mint;
-
     console.log(">>> MINT DETECTADO:", mint);
 
     const info = await getTokenInfo(mint);
 
-    const fromUser = transfers[0]?.fromUserAccount;
-    const toUser = transfers[0]?.toUserAccount;
+    const fromUser = transfers[0].fromUserAccount;
+    const toUser = transfers[0].toUserAccount;
 
-    // COMPRA
+    // -----------------------------------------------------
+    //                    COMPRA DETECTADA
+    // -----------------------------------------------------
     if (fromUser && toUser) {
-      console.log(">>> DETECTEI COMPRA");
-      const sig = await executeSwap(SOL_MINT, mint);
-      console.log(">>> SWAP EXECUTADO:", sig);
-    }
+      console.log(">>> COMPRA DETECTADA");
 
-    // VENDA
-    if (toUser && fromUser) {
-      console.log(">>> DETECTEI VENDA");
-      const sig = await executeSwap(mint, SOL_MINT);
-      console.log(">>> SWAP EXECUTADO:", sig);
-    }
-
-    return res.status(200).send("OK");
-
-  } catch (err) {
-    console.error("Webhook Error:", err);
-    return res.status(200).send("ERROR");
-  }
-});
-
-
-    // ------------------ COMPRA ------------------
-    if (fromUser && toUser) {
       const sig = await executeSwap(SOL_MINT, mint);
 
       await sendTelegram(
@@ -168,14 +173,17 @@ app.post("/helius", async (req, res) => {
 
 💰 Cópia: *~$2*
 🔗 Tx: https://solscan.io/tx/${sig}
-🔗 Tx original: https://solscan.io/tx/${tx.signature}
 
 🌀 MIROMA ONLINE – Operação replicada.`
       );
     }
 
-    // ------------------ VENDA ------------------
+    // -----------------------------------------------------
+    //                    VENDA DETECTADA
+    // -----------------------------------------------------
     if (toUser && fromUser) {
+      console.log(">>> VENDA DETECTADA");
+
       const sig = await executeSwap(mint, SOL_MINT);
 
       await sendTelegram(
@@ -188,7 +196,6 @@ app.post("/helius", async (req, res) => {
 💧 Liquidez: $${info.liquidity}
 
 🔗 Tx: https://solscan.io/tx/${sig}
-🔗 Tx original: https://solscan.io/tx/${tx.signature}
 
 🌀 MIROMA ONLINE – Venda espelhada.`
       );
@@ -202,10 +209,11 @@ app.post("/helius", async (req, res) => {
   }
 });
 
-// ------------------ START ------------------
+// -----------------------------------------------------
+//                     START SERVER
+// -----------------------------------------------------
 
-const PORT = process.env.PORT || 4000;
-
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🔥 MIROMA COPY BOT ONLINE – PORTA ${PORT} 🔥`);
 });
