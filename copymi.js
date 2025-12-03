@@ -24,11 +24,8 @@ const MONITORED_WALLETS = process.env.WALLETS
   ? process.env.WALLETS.split(",").map((w) => w.trim())
   : [];
 
-// Jupiter endpoints corretos
 const JUPITER_QUOTE = "https://api.jup.ag/quote";
 const JUPITER_SWAP = "https://api.jup.ag/swap";
-
-let processedSignatures = new Set();
 
 /* ============================================================
    LOG
@@ -38,24 +35,16 @@ function log(...msg) {
 }
 
 /* ============================================================
-   FUNÇÃO PARA COMPRAR 1 USDC DO TOKEN DETECTADO
+   SWAP GENÉRICO (com retry automático)
 ============================================================ */
-async function buy1USDC(mint) {
+async function executeSwap(inputMint, outputMint, amount, mode) {
   try {
-    log(`🔍 Copiando compra: 1 USDC → ${mint}`);
-
-    const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-    const amount = 1_000_000; // 1 USDC
-
-    /* =====================
-       1 - QUOTE
-    ====================== */
     const { data: quote } = await axios.get(JUPITER_QUOTE, {
       params: {
-        inputMint: USDC,
-        outputMint: mint,
+        inputMint,
+        outputMint,
         amount,
-        slippageBps: 2000, // 20% para memecoins voláteis
+        slippageBps: 2000,
       },
       headers: {
         "x-api-key": process.env.JUPITER_API_KEY,
@@ -63,20 +52,17 @@ async function buy1USDC(mint) {
     });
 
     if (!quote || !quote.outAmount) {
-      log("❌ Nenhuma rota encontrada para essa compra.");
-      return;
+      log(`❌ Nenhuma rota encontrada (${mode})`);
+      return null;
     }
 
-    /* =====================
-       2 - SWAP
-    ====================== */
     const { data: swap } = await axios.post(
       JUPITER_SWAP,
       {
         quoteResponse: quote,
         userPublicKey: BOT_PUBLIC,
-        dynamicSlippage: true,
         wrapAndUnwrapSol: true,
+        dynamicSlippage: true,
       },
       {
         headers: {
@@ -87,7 +73,6 @@ async function buy1USDC(mint) {
 
     const raw = Buffer.from(swap.swapTransaction, "base64");
     const tx = VersionedTransaction.deserialize(raw);
-
     tx.sign([BOT_KEYPAIR]);
 
     const sig = await connection.sendRawTransaction(tx.serialize(), {
@@ -95,50 +80,87 @@ async function buy1USDC(mint) {
       maxRetries: 5,
     });
 
-    log(`🚀 Compra executada com sucesso!`);
-    log(`🔗 https://solscan.io/tx/${sig}`);
+    log(`🚀 SWAP EXECUTADO (${mode}): https://solscan.io/tx/${sig}`);
+    return sig;
+
   } catch (err) {
-    if (err.response?.data)
-      log("❌ ERRO NA COMPRA:", err.response.data);
-    else log("❌ ERRO NA COMPRA:", err.message);
+    log(`Erro (${mode}):`, err.response?.data || err.message);
+    return null;
   }
 }
 
 /* ============================================================
-   DETECTAR COMPRAS DE TOKENS FUNGÍVEIS NAS WALLETS
+   COMPRAR O TOKEN COPIADO (LÓGICA HÍBRIDA)
+============================================================ */
+async function copyTrade(mint) {
+  log(`🔍 Tentando copiar compra do token: ${mint}`);
+
+  const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+  const SOL = "So11111111111111111111111111111111111111112";
+
+  /* ======================
+     1 - TENTAR USDC → token
+  ======================= */
+  const sigUSDC = await executeSwap(
+    USDC,
+    mint,
+    1_000_000,       // 1 USDC
+    "USDC → TOKEN"
+  );
+
+  if (sigUSDC) return; // deu certo!
+
+  /* ======================
+     2 - TENTAR SOL → token
+  ======================= */
+  const sigSOL = await executeSwap(
+    SOL,
+    mint,
+    10000000,         // 0.01 SOL
+    "SOL → TOKEN"
+  );
+
+  if (sigSOL) return;
+
+  log("⚠ Nenhuma rota encontrada nem com USDC, nem com SOL. Ignorando.");
+}
+
+/* ============================================================
+   DETECTAR COMPRAS FUNGÍVEIS
 ============================================================ */
 function detectTokenBuy(event) {
+  const results = [];
+
   try {
-    const accounts = event.accountData;
-
-    let results = [];
-
-    for (const acc of accounts) {
-      if (!acc.tokenBalanceChanges?.length) continue;
+    for (const acc of event.accountData) {
+      if (!acc.tokenBalanceChanges) continue;
 
       for (const c of acc.tokenBalanceChanges) {
-        const user = c.userAccount;
-        const mint = c.mint;
+        const isFungible = c.rawTokenAmount.decimals <= 12;
         const amount = Number(c.rawTokenAmount.tokenAmount);
+        const user = c.userAccount;
 
-        const fungible = c.rawTokenAmount.decimals <= 12;
-
-        if (fungible && amount > 0 && MONITORED_WALLETS.includes(user)) {
-          results.push({ user, mint, amount });
+        if (isFungible && amount > 0 && MONITORED_WALLETS.includes(user)) {
+          results.push({
+            user,
+            mint: c.mint,
+            amount,
+          });
         }
       }
     }
-
-    return results;
   } catch (err) {
     log("Erro detectTokenBuy:", err.message);
-    return [];
   }
+
+  return results;
 }
 
 /* ============================================================
    WEBHOOK HELIUS
 ============================================================ */
+const seen = new Set();
+
 app.post("/helius", async (req, res) => {
   res.sendStatus(200);
 
@@ -148,9 +170,8 @@ app.post("/helius", async (req, res) => {
   for (const event of events) {
     const sig = event.signature;
 
-    // Proteção anti duplicação
-    if (processedSignatures.has(sig)) continue;
-    processedSignatures.add(sig);
+    if (seen.has(sig)) continue;
+    seen.add(sig);
 
     log("===================================================");
     log(">>> RECEBI WEBHOOK");
@@ -165,18 +186,19 @@ app.post("/helius", async (req, res) => {
 
     for (const b of buys) {
       log(`📥 Wallet ${b.user} comprou ${b.amount} do token ${b.mint}`);
-      await buy1USDC(b.mint);
+      await copyTrade(b.mint);
     }
   }
 });
 
 /* ============================================================
-   START SERVER
+   START
 ============================================================ */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () =>
   console.log(`🔥 MIROMA COPY BOT ONLINE – PORTA ${PORT} 🔥`)
 );
+
 
 
 
