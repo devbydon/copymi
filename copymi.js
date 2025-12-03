@@ -35,55 +35,50 @@ function log(...msg) {
 }
 
 /* ============================================================
-   JUPITER - COMPRAR 1 USDC DO MINT
+   JUPITER - COMPRAR 1 USDC DO MINT (novo endpoint)
 ============================================================ */
 async function buy1USDC(mint) {
   try {
     log(`🔍 Iniciando cópia: comprando 1 USDC de ${mint}`);
 
-    // USDC SPL
-    const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const amount = 1_000_000; // 1 USDC
 
-    // 1 USDC
-    const amount = 1_000_000; // 1 USDC = 1e6
-
-    // Obter quote
-    const quote = await axios.get(JUPITER_QUOTE, {
+    // QUOTE
+    const { data: quote } = await axios.get(JUPITER_QUOTE, {
       params: {
-        inputMint: USDC_MINT,
+        inputMint: USDC,
         outputMint: mint,
         amount,
-        slippageBps: 300, // 3% slippage universal
+        slippageBps: 1000, // 10% universal
+        onlyDirectRoutes: false,
       },
     });
 
-    const quoteTx = quote.data;
-
-    if (!quoteTx || !quoteTx.outAmount) {
-      log("❌ Quote impossível — token sem rota ainda.");
+    if (!quote || !quote.outAmount) {
+      log("❌ Nenhuma rota encontrada para essa compra");
       return;
     }
 
-    log("📌 Quote OK:", quoteTx.outAmount, "tokens recebidos");
-
-    // Build transaction
-    const swap = await axios.post(JUPITER_SWAP, {
-      quoteResponse: quoteTx,
+    // BUILD & FETCH SWAP TX
+    const { data: swap } = await axios.post(JUPITER_SWAP, {
+      quoteResponse: quote,
       userPublicKey: BOT_PUBLIC,
       wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      dynamicSlippage: true,
     });
 
-    const swapTx = swap.data.swapTransaction;
-    const rawTx = Buffer.from(swapTx, "base64");
-    const tx = VersionedTransaction.deserialize(rawTx);
-
+    const raw = Buffer.from(swap.swapTransaction, "base64");
+    const tx = VersionedTransaction.deserialize(raw);
     tx.sign([BOT_KEYPAIR]);
 
     const sig = await connection.sendRawTransaction(tx.serialize(), {
       maxRetries: 5,
+      skipPreflight: true,
     });
 
-    log(`🚀 COMPRA EXECUTADA | TX: https://solscan.io/tx/${sig}`);
+    log(`🚀 COMPRA EXECUTADA | https://solscan.io/tx/${sig}`);
   } catch (err) {
     log("❌ ERRO NA COMPRA:", err.message);
   }
@@ -172,5 +167,6 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🔥 MIROMA COPY BOT ONLINE – PORTA ${PORT} 🔥`);
 });
+
 
 
