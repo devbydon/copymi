@@ -95,27 +95,61 @@ app.post("/helius", async (req, res) => {
   try {
     const tx = Array.isArray(req.body) ? req.body[0] : req.body;
 
+    console.log(">>> RECEBI WEBHOOK");
+    console.log("RAW BODY:", JSON.stringify(req.body, null, 2));
+    console.log("TX:", JSON.stringify(tx, null, 2));
+
     if (!tx) return res.status(200).send("NO_TX");
 
     const transfers = tx.tokenTransfers || [];
     const instructions = tx.instructions || [];
 
-    // detectar swap por nome do programa
+    console.log(">>> TRANSFERS:", transfers);
+    console.log(">>> INSTRUCTIONS:", instructions);
+
     const isSwap = instructions.some(i =>
       `${i.programId}`.toLowerCase().includes("jup") ||
       `${i.programId}`.toLowerCase().includes("rayd") ||
       `${i.programId}`.toLowerCase().includes("orca")
     );
 
+    console.log(">>> ISSWAP:", isSwap);
+
     if (!isSwap) return res.status(200).send("NOT_SWAP");
 
     if (transfers.length === 0) return res.status(200).send("NO_TRANSFERS");
 
     const mint = transfers[0].mint;
+
+    console.log(">>> MINT DETECTADO:", mint);
+
     const info = await getTokenInfo(mint);
 
     const fromUser = transfers[0]?.fromUserAccount;
     const toUser = transfers[0]?.toUserAccount;
+
+    // COMPRA
+    if (fromUser && toUser) {
+      console.log(">>> DETECTEI COMPRA");
+      const sig = await executeSwap(SOL_MINT, mint);
+      console.log(">>> SWAP EXECUTADO:", sig);
+    }
+
+    // VENDA
+    if (toUser && fromUser) {
+      console.log(">>> DETECTEI VENDA");
+      const sig = await executeSwap(mint, SOL_MINT);
+      console.log(">>> SWAP EXECUTADO:", sig);
+    }
+
+    return res.status(200).send("OK");
+
+  } catch (err) {
+    console.error("Webhook Error:", err);
+    return res.status(200).send("ERROR");
+  }
+});
+
 
     // ------------------ COMPRA ------------------
     if (fromUser && toUser) {
@@ -175,5 +209,6 @@ const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🔥 MIROMA COPY BOT ONLINE – PORTA ${PORT} 🔥`);
 });
+
 
 
