@@ -4,13 +4,15 @@ import axios from "axios";
 import {
   Connection,
   Keypair,
-  PublicKey,
-  VersionedTransaction,
+  VersionedTransaction
 } from "@solana/web3.js";
 
 const app = express();
 app.use(bodyParser.json());
 
+/* ============================================================
+   CONFIG
+============================================================ */
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API}`;
 const connection = new Connection(HELIUS_RPC);
 
@@ -22,8 +24,9 @@ const MONITORED_WALLETS = process.env.WALLETS
   ? process.env.WALLETS.split(",").map(w => w.trim())
   : [];
 
-const JUPITER_QUOTE = "https://quote-api.jup.ag/v6/quote";
-const JUPITER_SWAP = "https://quote-api.jup.ag/v6/swap";
+// NOVOS ENDPOINTS CORRETOS DA JUPITER
+const JUPITER_QUOTE = "https://api.jup.ag/swap/v1/quote";
+const JUPITER_SWAP = "https://api.jup.ag/swap/v1/swap";
 
 let processedSignatures = new Set();
 
@@ -35,11 +38,11 @@ function log(...msg) {
 }
 
 /* ============================================================
-   JUPITER - COMPRAR 1 USDC DO MINT (novo endpoint)
+   FUNÇÃO DE COMPRA — BUY 1 USDC EM QUALQUER TOKEN
 ============================================================ */
 async function buy1USDC(mint) {
   try {
-    log(`🔍 Iniciando cópia: comprando 1 USDC de ${mint}`);
+    log(`🔍 Copiando compra: 1 USDC → ${mint}`);
 
     const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
     const amount = 1_000_000; // 1 USDC
@@ -50,17 +53,16 @@ async function buy1USDC(mint) {
         inputMint: USDC,
         outputMint: mint,
         amount,
-        slippageBps: 1000, // 10% universal
-        onlyDirectRoutes: false,
+        slippageBps: 1500, // 15% slippage universal para tokens novos
       },
     });
 
     if (!quote || !quote.outAmount) {
-      log("❌ Nenhuma rota encontrada para essa compra");
+      log("❌ Sem rota disponível para compra desse token");
       return;
     }
 
-    // BUILD & FETCH SWAP TX
+    // BUILT TX
     const { data: swap } = await axios.post(JUPITER_SWAP, {
       quoteResponse: quote,
       userPublicKey: BOT_PUBLIC,
@@ -73,29 +75,25 @@ async function buy1USDC(mint) {
     const tx = VersionedTransaction.deserialize(raw);
     tx.sign([BOT_KEYPAIR]);
 
-    const sig = await connection.sendRawTransaction(tx.serialize(), {
-      maxRetries: 5,
+    const signature = await connection.sendRawTransaction(tx.serialize(), {
       skipPreflight: true,
+      maxRetries: 5,
     });
 
-    log(`🚀 COMPRA EXECUTADA | https://solscan.io/tx/${sig}`);
+    log(`🚀 COMPRA EFETUADA: https://solscan.io/tx/${signature}`);
   } catch (err) {
     log("❌ ERRO NA COMPRA:", err.message);
   }
 }
 
 /* ============================================================
-   PROCESSAR WEBHOOK HELIUS
+   DETECTAR COMPRA FUNGÍVEL EM QUALQUER DEX
 ============================================================ */
 function detectTokenBuy(event) {
   try {
-    const accounts = event.accountData;
-    const wallet = event.account || null;
-
     let result = [];
 
-    for (const acc of accounts) {
-      // Ignorar se não tem token change
+    for (const acc of event.accountData) {
       if (!acc.tokenBalanceChanges || acc.tokenBalanceChanges.length === 0)
         continue;
 
@@ -104,10 +102,9 @@ function detectTokenBuy(event) {
         const amount = Number(change.rawTokenAmount.tokenAmount);
         const mint = change.mint;
 
-        // Somente fungível
-        const isFungible =
-          change.rawTokenAmount.decimals >= 0 &&
-          change.rawTokenAmount.decimals <= 12;
+        // Apenas tokens fungíveis
+        const decimals = change.rawTokenAmount.decimals;
+        const isFungible = decimals >= 0 && decimals <= 12;
 
         if (!isFungible) continue;
 
@@ -117,28 +114,25 @@ function detectTokenBuy(event) {
         }
       }
     }
-
     return result;
   } catch (err) {
-    log("Erro no parser:", err.message);
+    log("❌ Erro parser:", err.message);
     return [];
   }
 }
 
 /* ============================================================
-   WEBHOOK
+   WEBHOOK HELIUS
 ============================================================ */
 app.post("/helius", async (req, res) => {
   res.sendStatus(200);
 
   const data = req.body;
-
   if (!Array.isArray(data)) return;
 
   for (const event of data) {
     const sig = event.signature;
 
-    // evitar loops e duplicados
     if (processedSignatures.has(sig)) continue;
     processedSignatures.add(sig);
 
@@ -149,12 +143,12 @@ app.post("/helius", async (req, res) => {
     const buys = detectTokenBuy(event);
 
     if (buys.length === 0) {
-      log("Nenhum token fungível recebido pelas wallets monitoradas.");
+      log("Nenhuma compra fungível detectada.");
       continue;
     }
 
     for (const b of buys) {
-      log(`📥 Wallet ${b.user} comprou token ${b.mint} (${b.amount})`);
+      log(`📥 Wallet ${b.user} comprou ${b.amount} do token ${b.mint}`);
       await buy1USDC(b.mint);
     }
   }
@@ -167,6 +161,5 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🔥 MIROMA COPY BOT ONLINE – PORTA ${PORT} 🔥`);
 });
-
 
 
