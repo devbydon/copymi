@@ -46,41 +46,28 @@ async function buy1USDC(mint) {
     const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
     const amount = 1_000_000; // 1 USDC
 
-    // NOVO QUOTE ULTRA
-    const quote = await axios.get("https://api.jup.ag/ultra/quote", {
-      headers: {
-        "Authorization": `Bearer ${process.env.JUP_API_KEY}`,
-      },
+    // QUOTE JUPITER NORMAL (v6)
+    const quote = await axios.get("https://quote-api.jup.ag/v6/quote", {
       params: {
         inputMint: USDC,
         outputMint: mint,
         amount,
-        slippage: 10,
-        swapMode: "ExactIn",
-        onlyDirectRoutes: false,
-        userPublicKey: BOT_PUBLIC, // OBRIGATÓRIO AGORA
+        slippageBps: 1000,
       },
     });
 
-    if (!quote.data || !quote.data.routePlan) {
-      log("❌ Nenhuma rota encontrada pela Ultra API");
+    if (!quote.data || !quote.data.outAmount) {
+      log("❌ Nenhuma rota encontrada para essa compra");
       return;
     }
 
-    // NOVO SWAP ULTRA
-    const swap = await axios.post(
-      "https://api.jup.ag/ultra/swap",
-      {
-        quoteResponse: quote.data,
-        userPublicKey: BOT_PUBLIC,
-        wrapAndUnwrapSol: true,
-      },
-      {
-        headers: {
-          "Authorization": `Bearer ${process.env.JUP_API_KEY}`,
-        },
-      }
-    );
+    // FETCH SWAP TX
+    const swap = await axios.post("https://quote-api.jup.ag/v6/swap", {
+      quoteResponse: quote.data,
+      userPublicKey: BOT_PUBLIC,
+      wrapAndUnwrapSol: true,
+      dynamicSlippage: true,
+    });
 
     const raw = Buffer.from(swap.data.swapTransaction, "base64");
     const tx = VersionedTransaction.deserialize(raw);
@@ -174,6 +161,7 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🔥 MIROMA COPY BOT ONLINE – PORTA ${PORT} 🔥`);
 });
+
 
 
 
