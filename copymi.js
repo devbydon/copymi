@@ -46,48 +46,44 @@ async function buy1USDC(mint) {
     const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
     const amount = 1_000_000; // 1 USDC
 
-    /* ------------------------------
-       1) QUOTE (Ultra API)
-    ------------------------------ */
-    const quoteRes = await axios.get(`${JUP_ULTRA}quote`, {
+    // NOVO QUOTE ULTRA
+    const quote = await axios.get("https://api.jup.ag/ultra/quote", {
+      headers: {
+        "Authorization": `Bearer ${process.env.JUP_API_KEY}`,
+      },
       params: {
         inputMint: USDC,
         outputMint: mint,
         amount,
-        slippageBps: 1500,
+        slippage: 10,
+        swapMode: "ExactIn",
+        onlyDirectRoutes: false,
+        userPublicKey: BOT_PUBLIC, // OBRIGATÓRIO AGORA
       },
-      headers: {
-        Authorization: `Bearer ${JUP_API_KEY}`,
-      }
     });
 
-    const quote = quoteRes.data;
-
-    if (!quote || !quote.routePlan) {
-      log("❌ Nenhuma rota encontrada.");
+    if (!quote.data || !quote.data.routePlan) {
+      log("❌ Nenhuma rota encontrada pela Ultra API");
       return;
     }
 
-    /* ------------------------------
-       2) SWAP (Ultra API)
-    ------------------------------ */
-    const swapRes = await axios.post(
-      `${JUP_ULTRA}swap`,
+    // NOVO SWAP ULTRA
+    const swap = await axios.post(
+      "https://api.jup.ag/ultra/swap",
       {
-        quoteResponse: quote,
+        quoteResponse: quote.data,
         userPublicKey: BOT_PUBLIC,
-        dynamicSlippage: true,
-        dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: "auto"
+        wrapAndUnwrapSol: true,
       },
       {
-        headers: { Authorization: `Bearer ${JUP_API_KEY}` }
+        headers: {
+          "Authorization": `Bearer ${process.env.JUP_API_KEY}`,
+        },
       }
     );
 
-    const swapTx = swapRes.data.swapTransaction;
-    const rawTx = Buffer.from(swapTx, "base64");
-    const tx = VersionedTransaction.deserialize(rawTx);
+    const raw = Buffer.from(swap.data.swapTransaction, "base64");
+    const tx = VersionedTransaction.deserialize(raw);
 
     tx.sign([BOT_KEYPAIR]);
 
@@ -96,9 +92,10 @@ async function buy1USDC(mint) {
       maxRetries: 5,
     });
 
-    log(`🚀 SWAP EXECUTADO | https://solscan.io/tx/${sig}`);
+    log(`🚀 SWAP EXECUTADO: https://solscan.io/tx/${sig}`);
+
   } catch (err) {
-    log("❌ ERRO NA COMPRA:", err.message);
+    log("❌ ERRO NA COMPRA:", err.response?.data || err.message);
   }
 }
 
@@ -177,6 +174,7 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🔥 MIROMA COPY BOT ONLINE – PORTA ${PORT} 🔥`);
 });
+
 
 
 
